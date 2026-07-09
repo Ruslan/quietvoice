@@ -1,0 +1,18 @@
+# secrets & local config
+.env
+
+# state, scratch, downloads
+voice_sessions/
+*.log
+
+# models & audio artifacts
+*.gguf
+*.bin
+*.wav
+*.ogg
+*.mp3
+
+# build output
+bin/
+
+.DS_Store
