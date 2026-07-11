@@ -1,0 +1,69 @@
+# QuietVoice inference node for AMD MI300X (ROCm 7.2.4 / gfx942).
+#
+# This image bundles the PREBUILT ROCm engine binaries (crispasr + llama.cpp) —
+# it does NOT compile them, so the build is fast and needs no GPU (it only copies
+# files). The CGO-free Go `inferenced` binary is cross-built in the first stage.
+#
+# Base matches the build box exactly: Ubuntu 24.04 (glibc 2.39) + ROCm 7.2.4.
+#
+# ── Prereq (once, from the Mac): upload the two prebuilt bundles to your CDN ──
+#   piccy dist/rocm-mi300x-crispasr.tgz   ->  CRISPASR_ROCM_URL
+#   piccy dist/rocm-mi300x-llamacpp.tgz   ->  LLAMACPP_ROCM_URL
+#
+# ── Build (on the MI300X host; Docker present) ──
+#   make inferenced-docker-mi300x CRISPASR_ROCM_URL=<url> LLAMACPP_ROCM_URL=<url>
+#
+# ── Run (needs the GPU + models mounted) ──
+#   docker run --rm --device /dev/kfd --device /dev/dri \
+#     --group-add video --group-add render \
+#     --ipc host --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+#     -p 9095:9095 -v /workspace/models:/models --env-file .env.node \
+#     quietvoice-inferenced-mi300x
+#   (.env.node points TTS_MODEL / GEMMA_MODEL / WHISPER_MODEL at /models/…)
+
+# ---- build: CGO-free static inferenced ----
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/inferenced ./cmd/inferenced
+
+# ---- runtime: ROCm base + prebuilt engine binaries (no compile) ----
+FROM rocm/dev-ubuntu-24.04:7.2.4
+ARG CRISPASR_ROCM_URL
+ARG LLAMACPP_ROCM_URL
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends ffmpeg wget ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Fetch + unpack the prebuilt ROCm bundles.
+#   crispasr.tgz  -> /opt/qv/rocm-mi300x/{crispasr, lib/*.so}
+#   llamacpp.tgz  -> /opt/qv/llamacpp/bin/{llama-server, llama-cli, *.so}
+WORKDIR /opt/qv
+RUN test -n "$CRISPASR_ROCM_URL" && test -n "$LLAMACPP_ROCM_URL" \
+ && wget -qO crispasr.tgz "$CRISPASR_ROCM_URL" && tar xzf crispasr.tgz && rm crispasr.tgz \
+ && mkdir -p llamacpp && wget -qO llamacpp.tgz "$LLAMACPP_ROCM_URL" \
+ && tar xzf llamacpp.tgz -C llamacpp && rm llamacpp.tgz
+
+ENV CRISPASR_DIR=/opt/qv/rocm-mi300x \
+    LLAMA_DIR=/opt/qv/llamacpp/bin
+# Bundled .so live next to the binaries; /opt/rocm/lib supplies hip/rocBLAS/etc.
+ENV PATH="${CRISPASR_DIR}:${LLAMA_DIR}:${PATH}" \
+    LD_LIBRARY_PATH="${CRISPASR_DIR}/lib:${LLAMA_DIR}:/opt/rocm/lib"
+
+# Wire inferenced to the bundled binaries (keys from internal/config).
+ENV CRISPASR_BIN=${CRISPASR_DIR}/crispasr \
+    TTS_SERVER_BIN=${CRISPASR_DIR}/crispasr \
+    ASR_SERVER_BIN=${CRISPASR_DIR}/crispasr \
+    TTS_LIB_DIR=${CRISPASR_DIR}/lib \
+    GEMMA_SERVER_BIN=${LLAMA_DIR}/llama-server \
+    GEMMA_LIB_DIR=${LLAMA_DIR} \
+    LLAMA_MTMD_BIN=llama-mtmd-cli \
+    INFERENCE_LISTEN=:9095
+# NOTE: listen_voice's Interpret cold-spawns `llama-mtmd-cli`, which is NOT in the
+# current llamacpp bundle (it built only llama-server + llama-cli). `say` and ASR
+# work as-is; to enable Interpret, rebuild llama.cpp adding the `llama-mtmd-cli`
+# target and repack the bundle — it will then be on PATH (LLAMA_DIR) automatically.
+
+COPY --from=build /out/inferenced /usr/local/bin/inferenced
+EXPOSE 9095
+ENTRYPOINT ["inferenced"]

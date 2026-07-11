@@ -1,0 +1,22 @@
+# QuietVoice control plane — MCP (say / listen_voice) + Telegram transport.
+# CPU-only, no GPU: this half runs ANYWHERE (Mac Docker, any Linux box, a VPS).
+# The inference plane is a separate service it talks to over HTTP (INFERENCE_MODE=remote).
+#
+# Build:  docker build -f deploy/Dockerfile.control-plane -t quietvoice-control .
+# Run:    docker run --rm -p 8090:8090 --env-file .env quietvoice-control
+#         (point INFERENCE_URL at your inference node; on a Mac that node runs
+#          NATIVELY on Metal — Metal is not available inside Docker.)
+
+# ---- build: CGO-free static Go binary ----
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/quietvoice ./cmd/quietvoice
+
+# ---- runtime: tiny image + ffmpeg (say transcodes WAV->ogg/opus) ----
+FROM alpine:3.20
+RUN apk add --no-cache ffmpeg ca-certificates
+COPY --from=build /out/quietvoice /usr/local/bin/quietvoice
+# MCP JSON-RPC endpoint: POST /rpc (override with MCP_LISTEN).
+EXPOSE 8090
+ENTRYPOINT ["quietvoice"]
