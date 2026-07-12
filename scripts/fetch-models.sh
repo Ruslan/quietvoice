@@ -44,9 +44,10 @@ for entry in "${MODELS[@]}"; do
   echo "→ $file   ($repo)"
   url="https://huggingface.co/$repo/resolve/main/$file"
   if command -v aria2c >/dev/null 2>&1; then
-    # 16 connections; download to <file>.part then rename so a kill never leaves a half-file
-    # mistaken for complete. -c resumes a prior aria2c .part (via its .aria2 control file).
-    aria2c -c -x16 -s16 -k1M --file-allocation=none --console-log-level=warn -o "$file.part" "$url" \
+    # 8 connections (HF xet signs per byte-range, so more segments = more self-healing 403s);
+    # download to <file>.part then rename so a kill never leaves a half-file mistaken for
+    # complete. -c resumes a prior aria2c .part (via its .aria2 control file).
+    aria2c -c -x8 -s8 -k1M --file-allocation=none --max-tries=6 --retry-wait=2 --console-log-level=warn -o "$file.part" "$url" \
       || { echo "!! download FAILED: $url  (404? wrong repo/filename — check HF)"; exit 1; }
   else
     wget -q --show-progress -O "$file.part" "$url" \
