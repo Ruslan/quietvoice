@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -61,11 +63,13 @@ func gemmaChatServer(ctx context.Context, client *http.Client, base, token, wavP
 		// temp 0 for determinism: same audio must not yield different intents
 		// (one run kept "Claude", another dropped it — doc/eval-listen-gemma-drops-meaning.md).
 		"temperature": 0.0,
-		// Gemma E4B emits a reasoning block before its answer; fidelity mode returns
-		// the FULL message (no ~100-token cap), so give ample room for think + a
-		// complete, non-truncated answer. (Long narrations also want a bigger --ctx-size
-		// on the gemma server — separate follow-up.)
-		"max_tokens": 3072,
+		// Gemma emits a reasoning block before its answer; fidelity mode returns the
+		// FULL message (no ~100-token cap), so give ample room for think + a complete,
+		// non-truncated answer. Env-tunable: the assisted ensemble with 2 long ASR refs
+		// can reason past 3072 and hit the cap BEFORE emitting the answer -> empty content
+		// (verified on MI300X 2026-07-12). Bump GEMMA_MAX_TOKENS (and GEMMA_CTX_SIZE) on a
+		// big-VRAM node. Must stay <= the gemma server's --ctx-size.
+		"max_tokens": gemmaMaxTokens(),
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(base, "/v1/chat/completions"), bytes.NewReader(body))
@@ -88,8 +92,10 @@ func gemmaChatServer(ctx context.Context, client *http.Client, base, token, wavP
 	var out struct {
 		Choices []struct {
 			Message struct {
-				Content json.RawMessage `json:"content"`
+				Content          json.RawMessage `json:"content"`
+				ReasoningContent json.RawMessage `json:"reasoning_content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -98,7 +104,28 @@ func gemmaChatServer(ctx context.Context, client *http.Client, base, token, wavP
 	if len(out.Choices) == 0 {
 		return "", fmt.Errorf("chat response had no choices")
 	}
-	return decodeChatContent(out.Choices[0].Message.Content)
+	text, err := decodeChatContent(out.Choices[0].Message.Content)
+	if err != nil {
+		return "", err
+	}
+	// Diagnostic: when the answer is empty but the model reasoned (some llama.cpp
+	// builds route <think> to reasoning_content), the request hit max_tokens mid-think.
+	// Surface it loudly instead of silently returning "" — raise GEMMA_MAX_TOKENS/CTX_SIZE.
+	if strings.TrimSpace(text) == "" {
+		rc, _ := decodeChatContent(out.Choices[0].Message.ReasoningContent)
+		log.Printf("[gemma pool] empty content (finish=%q); reasoning_content=%d chars — likely hit max_tokens mid-reasoning, raise GEMMA_MAX_TOKENS/GEMMA_CTX_SIZE", out.Choices[0].FinishReason, len(strings.TrimSpace(rc)))
+	}
+	return text, nil
+}
+
+// gemmaMaxTokens is the interpret generation cap (env GEMMA_MAX_TOKENS, default 3072).
+func gemmaMaxTokens() int {
+	if v := os.Getenv("GEMMA_MAX_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 3072
 }
 
 // decodeChatContent extracts the assistant text from a chat message `content`

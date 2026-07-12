@@ -285,7 +285,16 @@ func launchSpec(cfg Config, role, model string, port int) (launchPlan, error) {
 			"--mmproj", cfg.GemmaMMProj,
 			"-ngl", "999", // offload all layers to the GPU (llama.cpp caps at what fits);
 			// without this llama.cpp defaults to CPU-only and a 12B bf16 brain runs on CPU.
-			"--ctx-size", "8192", // room for the system prompt + prior say-context + audio tokens
+			"--ctx-size", envOr("GEMMA_CTX_SIZE", "8192"), // room for system prompt + say-context + audio +
+			// Gemma's reasoning block. On a big-VRAM node bump GEMMA_CTX_SIZE (e.g. 32768): the
+			// assisted ensemble with 2 long ASR refs can make Gemma reason past a small ctx and
+			// return empty (verified on MI300X 2026-07-12). KV is cheap at 192 GB.
+			// Cap the thinking budget so reasoning ALWAYS terminates and an answer is emitted.
+			// -1 = unrestricted (default; fine for 1 ASR ref). With 2 refs (voxtral+whisper)
+			// Gemma spiralled to 58k chars of reasoning_content, hit max_tokens, returned EMPTY
+			// (verified on MI300X 2026-07-12). A positive budget (e.g. 2048) keeps thinking but
+			// forces a wrap-up. See GEMMA_REASONING_BUDGET in deploy/.env.demo-example.
+			"--reasoning-budget", envOr("GEMMA_REASONING_BUDGET", "-1"),
 			"--host", "127.0.0.1",
 			"--port", ps,
 		}
@@ -293,6 +302,14 @@ func launchSpec(cfg Config, role, model string, port int) (launchPlan, error) {
 	default:
 		return launchPlan{}, fmt.Errorf("unknown replica role %q (want tts, asr, or gemma)", role)
 	}
+}
+
+// envOr returns the environment value for key, or def when unset/empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func (c *roleLauncher) launch(_ context.Context, role, model string, port int) (*replica, error) {
