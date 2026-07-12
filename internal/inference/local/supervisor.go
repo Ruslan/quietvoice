@@ -3,6 +3,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -236,17 +237,41 @@ func launchSpec(cfg Config, role, model string, port int) (launchPlan, error) {
 			"--port", ps,
 		}
 		if cfg.TTSVoiceDir != "" {
+			// crispasr needs the dir to exist to store uploaded voices; create it so a
+			// fresh node's first POST /v1/voices doesn't 400 on a missing directory.
+			if err := os.MkdirAll(cfg.TTSVoiceDir, 0o755); err != nil {
+				return launchPlan{}, fmt.Errorf("cannot create TTS voice-dir %q: %w", cfg.TTSVoiceDir, err)
+			}
 			args = append(args, "--voice-dir", cfg.TTSVoiceDir)
+		} else {
+			log.Printf("[supervisor] WARNING: launching tts with no --voice-dir (TTS_VOICE_DIR unset and WorkDir empty); POST /v1/voices will 400 and `say` will break end-to-end")
 		}
 		return launchPlan{bin: cfg.TTSServerBin, args: args, env: envWithLibDir(cfg.TTSLibDir), healthPath: ttsHealthPath}, nil
 	case "asr":
-		if cfg.ASRModel == "" {
-			return launchPlan{}, fmt.Errorf("cannot launch: ASR_MODEL not configured")
+		// A model-keyed asr replica (model != "") resolves its gguf path AND crispasr
+		// backend from the recognizer registry by name, so Voxtral (voxtral4b) and
+		// Whisper (whisper) can run as SEPARATE hot pools — the genuine assisted
+		// ensemble on a hot fabric. The default ("") pool keeps the single global
+		// ASR model/backend (backward-compatible single-whisper node).
+		modelPath := cfg.ASRModel
+		backend := cfg.ASRBackend
+		if model != "" {
+			rec, ok := recognizerByName(cfg.Recognizers, model)
+			if !ok {
+				return launchPlan{}, fmt.Errorf("cannot launch asr replica %q: no recognizer with that name (set VOXTRAL_MODEL/WHISPER_MODEL or ASR_RECOGNIZERS)", model)
+			}
+			modelPath = rec.Model
+			if rec.Backend != "" {
+				backend = rec.Backend
+			}
+		}
+		if modelPath == "" {
+			return launchPlan{}, fmt.Errorf("cannot launch: ASR model not configured for %q", model)
 		}
 		args := []string{
 			"--server",
-			"--backend", cfg.ASRBackend,
-			"-m", cfg.ASRModel,
+			"--backend", backend,
+			"-m", modelPath,
 			"--host", "127.0.0.1",
 			"--port", ps,
 		}
@@ -258,6 +283,9 @@ func launchSpec(cfg Config, role, model string, port int) (launchPlan, error) {
 		args := []string{
 			"-m", cfg.GemmaModel,
 			"--mmproj", cfg.GemmaMMProj,
+			"-ngl", "999", // offload all layers to the GPU (llama.cpp caps at what fits);
+			// without this llama.cpp defaults to CPU-only and a 12B bf16 brain runs on CPU.
+			"--ctx-size", "8192", // room for the system prompt + prior say-context + audio tokens
 			"--host", "127.0.0.1",
 			"--port", ps,
 		}

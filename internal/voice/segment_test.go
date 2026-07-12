@@ -76,28 +76,28 @@ func TestSplitPacksToCap(t *testing.T) {
 	}
 }
 
-func TestSplitMultibyte(t *testing.T) {
-	text := "Primer oración. ¡Segunda oración! ¿Tercera oración? Cuarta."
+func TestSplitRussian(t *testing.T) {
+	text := "Первое предложение. Второе предложение! Третье предложение? Четвёртое."
 	got := splitText(text)
 	if len(got) == 0 {
-		t.Fatal("no chunks for multibyte text")
+		t.Fatal("no chunks for russian text")
 	}
 	assertUnderCap(t, got)
 	assertNoSplitWord(t, text, got)
 	// The three terminator types must all act as boundaries but stay attached.
 	joined := strings.Join(got, " ")
-	for _, term := range []string{"oración.", "oración!", "oración?", "Cuarta."} {
+	for _, term := range []string{"предложение.", "предложение!", "предложение?", "Четвёртое."} {
 		if !strings.Contains(joined, term) {
 			t.Fatalf("terminator not kept with sentence: missing %q in %q", term, got)
 		}
 	}
 }
 
-func TestSplitMultibyteRespectsRuneCap(t *testing.T) {
-	// Long Multibyte text: Spanish accented characters are 2 bytes/char, so a byte-based cap would
+func TestSplitRussianRespectsRuneCap(t *testing.T) {
+	// Long Russian text: Cyrillic is 2 bytes/char, so a byte-based cap would
 	// over-fragment. Verify chunks are sized by runes, comfortably multi-chunk
 	// but each under the rune cap.
-	sentence := "Esta es una oración bastante larga en español para fines de prueba. "
+	sentence := "Это довольно длинное предложение на русском языке для проверки. "
 	got := splitText(strings.Repeat(sentence, 12))
 	if len(got) < 2 {
 		t.Fatalf("expected multiple chunks, got %d", len(got))

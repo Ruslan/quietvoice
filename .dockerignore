@@ -1,0 +1,23 @@
+# Keep the Docker build context small (compose builds with context: repo root).
+# The Go build stage only needs cmd/ internal/ go.mod go.sum; the runtime stage
+# needs deploy/boot-fabric.sh. Everything below is private/heavy and must NOT ship
+# into the image or bust the Go build-cache on unrelated changes.
+.git/
+dist/
+build/
+books/
+doc/
+models/
+gemma-test/
+secrets/
+voice_sessions/
+tmp/
+wip/
+.claude/
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.gguf
+*.log
+.DS_Store

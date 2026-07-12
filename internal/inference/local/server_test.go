@@ -48,7 +48,7 @@ func TestTTSSpeakAndHealth(t *testing.T) {
 	if err := ttsHealth(context.Background(), client, srv.URL, ""); err != nil {
 		t.Fatalf("ttsHealth: %v", err)
 	}
-	got, err := ttsSpeak(context.Background(), client, srv.URL, "", "ded", "hello")
+	got, err := ttsSpeak(context.Background(), client, srv.URL, "", "ded", "привет")
 	if err != nil {
 		t.Fatalf("ttsSpeak: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestSynthesizeFailsOverAndEvictsDeadWorker(t *testing.T) {
 	p.add(&worker{url: deadURL, role: "tts"})
 	p.add(&worker{url: healthyURL, role: "tts"})
 
-	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "hello"})
+	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "привет"})
 	if err != nil {
 		t.Fatalf("Synthesize should fail over to the healthy worker, got: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestSynthesizeRetriesNon2xxWithoutEvict(t *testing.T) {
 	p.add(&worker{url: badURL, role: "tts"}) // checked out first
 	p.add(&worker{url: goodURL, role: "tts"})
 
-	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "hello"})
+	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "привет"})
 	if err != nil {
 		t.Fatalf("Synthesize should retry past the 500 worker, got: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestSynthesizeServerMode(t *testing.T) {
 		t.Fatalf("Health (server mode): %v", err)
 	}
 
-	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "hello world"})
+	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "привет мир"})
 	if err != nil {
 		t.Fatalf("Synthesize: %v", err)
 	}

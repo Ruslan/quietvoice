@@ -7,6 +7,7 @@ package config
 import (
 	"bufio"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -97,6 +98,12 @@ type Config struct {
 	VoiceName       string // VOICE_NAME (falls back to legacy TTS_VOICE)
 	VoiceWav        string // VOICE_WAV: local path to the reference wav
 	VoiceTranscript string // VOICE_TXT resolved: file contents if it names a file, else the literal text
+
+	// VoiceRotate enables per-session voice rotation: each MCP session is
+	// assigned a distinct, sticky voice from the node's voice pool instead of
+	// everyone sharing VoiceName. Default OFF (today's single-voice behavior).
+	// See internal/voice.Service.
+	VoiceRotate bool // VOICE_ROTATE
 }
 
 // Load reads configuration from .env (if present) then the environment.
@@ -148,7 +155,7 @@ func Load() Config {
 		VoxtralModel:  os.Getenv("VOXTRAL_MODEL"),
 		WhisperModel:  os.Getenv("WHISPER_MODEL"),
 		Recognizers:   parseRecognizers(os.Getenv("ASR_RECOGNIZERS")),
-		Lang:          env("ASR_LANG", "ru"),
+		Lang:          env("ASR_LANG", "auto"), // auto-detect RU/EN per clip; pin with ASR_LANG=ru
 
 		StorePath:   env("STORE_PATH", "voice_sessions/state.json"),
 		WorkDir:     env("WORK_DIR", "voice_sessions/work"),
@@ -161,7 +168,17 @@ func Load() Config {
 		VoiceName:       firstEnv("VOICE_NAME", "TTS_VOICE"),
 		VoiceWav:        strings.TrimSpace(os.Getenv("VOICE_WAV")),
 		VoiceTranscript: voiceTranscript(os.Getenv("VOICE_TXT")),
+		VoiceRotate:     envBool("VOICE_ROTATE"),
 	}
+
+	// Safe default for the TTS voice registry: without a --voice-dir, crispasr
+	// rejects POST /v1/voices with 400 and TTS/say break end-to-end. Default it to a
+	// writable dir under WorkDir so ANY deploy path — not just the skill script —
+	// has somewhere to persist a voice the control plane uploads at runtime.
+	if c.TTSVoiceDir == "" && c.WorkDir != "" {
+		c.TTSVoiceDir = filepath.Join(c.WorkDir, "voices")
+	}
+
 	return c
 }
 

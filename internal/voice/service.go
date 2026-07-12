@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
@@ -45,7 +46,14 @@ type Config struct {
 	SayContextCount int                  // previous say updates fed to interpret (default 2)
 	WorkDir         string               // scratch dir for transcoded audio
 	ListenMode      inference.ListenMode // how audio is turned into text (default assisted)
+	ASRLang         string               // ASR language hint forwarded to the node ("auto" = detect; default "auto")
 	EvalLogPath     string               // JSONL log of interpretations for offline re-eval
+
+	// VoiceRotate enables per-session voice rotation: each session is assigned a
+	// distinct, sticky voice from the inference engine's voice pool instead of
+	// everyone sharing the engine's single configured voice. Default OFF. See
+	// Service.chooseVoice.
+	VoiceRotate bool
 }
 
 // Service ties transport, inference and storage together.
@@ -59,6 +67,13 @@ type Service struct {
 	waiters map[string]chan store.VoiceMessage // requestID -> delivery channel
 
 	evalMu sync.Mutex // serializes appends to the eval log
+
+	// voicePoolMu guards the cached voice pool used by per-session rotation
+	// (VoiceRotate). ListVoices is a network call to the inference node, so it is
+	// fetched once and reused rather than called on every Say; it is only
+	// refetched when the cache is empty (see voicePool).
+	voicePoolMu sync.Mutex
+	voicePool   []string
 }
 
 // New builds a Service, applying config defaults.
@@ -74,6 +89,9 @@ func New(cfg Config, st store.Store, engine inference.Engine, tp Transport) *Ser
 	}
 	if cfg.ListenMode == "" {
 		cfg.ListenMode = inference.ModeAssisted
+	}
+	if cfg.ASRLang == "" {
+		cfg.ASRLang = "auto" // let the recognizer detect RU/EN per clip unless pinned
 	}
 	return &Service{
 		cfg:     cfg,
@@ -123,7 +141,12 @@ func (s *Service) Say(ctx context.Context, sessionID, text string) (string, erro
 		chunks = []string{text}
 	}
 
-	wavs, cleanup, err := s.synthesizeChunks(ctx, chunks)
+	// Per-session voice rotation (VOICE_ROTATE): pick (or reuse) this session's
+	// sticky voice. Empty means "no rotation" — the engine falls back to its own
+	// single configured voice, exactly like today.
+	chosenVoice := s.chooseVoice(ctx, sess)
+
+	wavs, cleanup, err := s.synthesizeChunks(ctx, chunks, chosenVoice)
 	defer cleanup()
 	if err != nil {
 		return "", fmt.Errorf("say: %w", err)
@@ -167,7 +190,7 @@ func (s *Service) Say(ctx context.Context, sessionID, text string) (string, erro
 // tries; if any chunk ultimately fails, the first error is returned. The
 // returned cleanup removes every produced WAV and must always be deferred by the
 // caller, including on error.
-func (s *Service) synthesizeChunks(ctx context.Context, chunks []string) ([]string, func(), error) {
+func (s *Service) synthesizeChunks(ctx context.Context, chunks []string, voice string) ([]string, func(), error) {
 	wavs := make([]string, len(chunks))
 	cleanup := func() {
 		for _, w := range wavs {
@@ -214,7 +237,7 @@ func (s *Service) synthesizeChunks(ctx context.Context, chunks []string) ([]stri
 				if ctx.Err() != nil {
 					return
 				}
-				res, err := s.engine.Synthesize(ctx, inference.SynthesizeRequest{Text: chunk})
+				res, err := s.engine.Synthesize(ctx, inference.SynthesizeRequest{Text: chunk, Voice: voice})
 				switch {
 				case err != nil:
 					lastErr = err
@@ -351,6 +374,7 @@ func (s *Service) processVoice(ctx context.Context, sess *store.Session, promptT
 	prev := s.previousSay(sess.ID)
 	result, err := s.engine.Interpret(ctx, inference.AudioInput{Path: vm.LocalPath}, inference.InterpretRequest{
 		Mode:          s.cfg.ListenMode,
+		Language:      s.cfg.ASRLang,
 		AgentQuestion: promptText,
 		PreviousSay:   prev,
 	})
@@ -379,12 +403,15 @@ func (s *Service) processVoice(ctx context.Context, sess *store.Session, promptT
 	if fromPending {
 		label = "Recognized (saved voice)"
 	}
-	feedback := fmt.Sprintf("%s: %s\n↳ sent to your agent", label, result.Intent)
+	// agentText carries the inline emotion cues (in Intent) plus the structured
+	// "[urgency: … · tone: …]" marker when the delivery was notably urgent/emotional.
+	agentText := result.AgentText()
+	feedback := fmt.Sprintf("%s: %s\n↳ sent to your agent", label, agentText)
 	if err := s.tp.SendMessage(ctx, sess.TelegramChatID, feedback); err != nil {
 		log.Printf("listen_voice: recognition feedback: %v", err)
 	}
 
-	return result.Intent, nil
+	return agentText, nil
 }
 
 // evalRecord is one appended line in the re-evaluation corpus: it captures the
@@ -399,6 +426,9 @@ type evalRecord struct {
 	Prompt      string                    `json:"prompt,omitempty"`
 	Transcripts []inference.TranscriptRef `json:"transcripts,omitempty"`
 	Intent      string                    `json:"intent"`
+	Type        string                    `json:"type,omitempty"`
+	Tone        string                    `json:"tone,omitempty"`
+	Urgency     string                    `json:"urgency,omitempty"`
 }
 
 // logEval appends one JSONL record for offline re-evaluation. Best-effort.
@@ -415,6 +445,9 @@ func (s *Service) logEval(vm *store.VoiceMessage, prompt string, result *inferen
 		Prompt:      prompt,
 		Transcripts: result.Transcripts,
 		Intent:      result.Intent,
+		Type:        result.Type,
+		Tone:        result.Tone,
+		Urgency:     result.Urgency,
 	}
 	line, err := json.Marshal(rec)
 	if err != nil {
@@ -471,6 +504,88 @@ func (s *Service) completeRequest(reqID string, status store.RequestStatus) {
 	req.Status = status
 	req.CompletedAt = &now
 	_ = s.store.UpdateRequest(req)
+}
+
+// chooseVoice implements per-session voice rotation (VOICE_ROTATE). It returns
+// the voice name to pass on SynthesizeRequest.Voice, or "" to leave voice
+// selection to the engine's own default (today's single-voice behavior) — the
+// caller for both the OFF and the no-pool-available cases.
+//
+// Design (sticky assignment, deterministic seed):
+//  1. Rotation disabled: return "" immediately, no store access.
+//  2. Session already has an assigned voice: return it. This is what makes
+//     rotation STABLE across pool changes — a voice is only ever chosen once
+//     per session, so adding/removing voices later only affects new sessions.
+//  3. First say for this session: fetch (or reuse the cached) voice pool, pick
+//     pool[fnvHash(sessionID) % len(pool)], persist it onto the session, and
+//     return it. An empty/unavailable pool returns "" — the engine falls back
+//     to its single configured voice; say() must never fail because rotation
+//     couldn't pick.
+func (s *Service) chooseVoice(ctx context.Context, sess *store.Session) string {
+	if !s.cfg.VoiceRotate {
+		return ""
+	}
+	if sess.Voice != "" {
+		return sess.Voice
+	}
+
+	pool := s.voicePoolSnapshot(ctx)
+	if len(pool) == 0 {
+		return "" // no pool available: fall back to the engine's configured voice
+	}
+
+	idx := int(fnvHash(sess.ID) % uint32(len(pool)))
+	chosen := pool[idx]
+
+	sess.Voice = chosen
+	if err := s.store.UpsertSession(sess); err != nil {
+		// Best-effort: if persistence fails, still speak with the chosen voice for
+		// THIS call; a future call will simply re-derive (and try to persist) again.
+		log.Printf("say: persist voice assignment %q for session %s: %v", chosen, sess.ID, err)
+	}
+	return chosen
+}
+
+// voicePoolSnapshot returns the cached voice pool, fetching it from the engine
+// (over the network, via the optional inference.VoiceLister interface) only
+// when the cache is empty — chooseVoice already only calls this for a session
+// that has no assigned voice yet, so this keeps ListVoices off the hot path of
+// every say(). Returns nil when the engine can't list voices, the call fails,
+// or it returns no voices; callers treat that as "no pool available".
+func (s *Service) voicePoolSnapshot(ctx context.Context) []string {
+	s.voicePoolMu.Lock()
+	cached := s.voicePool
+	s.voicePoolMu.Unlock()
+	if len(cached) > 0 {
+		return cached
+	}
+
+	vl, ok := s.engine.(inference.VoiceLister)
+	if !ok {
+		return nil
+	}
+	voices, err := vl.ListVoices(ctx)
+	if err != nil || len(voices) == 0 {
+		if err != nil {
+			log.Printf("say: voice rotation: list voices: %v", err)
+		}
+		return nil
+	}
+
+	s.voicePoolMu.Lock()
+	s.voicePool = voices
+	s.voicePoolMu.Unlock()
+	return voices
+}
+
+// fnvHash deterministically hashes s into a uint32, used ONLY to SEED a
+// session's first voice assignment (see chooseVoice) — the result is then
+// persisted, never recomputed, so a later change to the pool size cannot remap
+// an already-assigned session.
+func fnvHash(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
 }
 
 // ensureSession returns the session for id, creating it bound to the default

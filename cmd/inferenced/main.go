@@ -16,6 +16,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,7 +42,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+inference.RouteHealth, node.health)
 	// One OpenAI-compatible surface (inbound == outbound), plus the native rich
-	// intent route.
+	// intent route. See inferenced-unified-api-plan.md.
 	mux.HandleFunc("POST "+inference.RouteSpeech, node.auth(node.speech))
 	mux.HandleFunc("GET "+inference.RouteVoices, node.auth(node.listVoices))
 	mux.HandleFunc("POST "+inference.RouteVoices, node.auth(node.uploadVoice))
@@ -50,7 +52,13 @@ func main() {
 		mux.HandleFunc("GET /admin/replicas", node.auth(node.adminList))
 		mux.HandleFunc("POST /admin/replicas", node.auth(node.adminSet))
 		mux.HandleFunc("DELETE /admin/replicas/{role}", node.auth(node.adminDelete))
-		log.Printf("admin API enabled: /admin/replicas (roles tts/asr/gemma, max %d replicas total)", cfg.TTSMaxReplicas)
+		// Raw pass-through tunnel to ONE replica by (role, index), bypassing the
+		// pool's load-balancing: /raw/{role}/{index}/<upstream path>. For scripts
+		// that must pin a specific instance, and for orchestration that owns the
+		// upstream contract itself (e.g. the Gemma prompt moving up into the MCP
+		// layer, talking /v1/chat/completions to a chosen llama-server directly).
+		mux.HandleFunc("/raw/{role}/{index}/{path...}", node.auth(node.rawProxy))
+		log.Printf("admin API enabled: /admin/replicas + /raw/{role}/{index}/... (roles tts/asr/gemma, max %d replicas total)", cfg.TTSMaxReplicas)
 	}
 
 	srv := &http.Server{Addr: cfg.InferenceListen, Handler: mux, ReadTimeout: 10 * time.Minute, WriteTimeout: 10 * time.Minute}
@@ -343,6 +351,58 @@ func (n *node) adminDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, replicasResponse{Replicas: n.local.Replicas(r.Context())})
+}
+
+// rawProxy is a thin reverse proxy that forwards a request verbatim to ONE
+// replica selected by (role, index), deliberately bypassing the pool's idle
+// load-balancing. Path: /raw/{role}/{index}/<upstream path>. An optional
+// ?model=NAME scopes the lookup to a non-default model pool (the routing param
+// is stripped before the request is forwarded). Because it hands raw access to
+// a backend, it lives behind the same admin gate as /admin/replicas.
+//
+// Examples:
+//
+//	GET  /raw/tts/1/v1/voices                 -> tts replica #1 GET /v1/voices
+//	POST /raw/gemma/1/v1/chat/completions     -> gemma replica #1 (audio chat)
+//	GET  /raw/tts/2/v1/voices?model=qwen3-tts-1.7b
+func (n *node) rawProxy(w http.ResponseWriter, r *http.Request) {
+	index, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil || index < 1 {
+		http.Error(w, "raw tunnel: index must be a positive integer", http.StatusBadRequest)
+		return
+	}
+	role := r.PathValue("role")
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	target, ok := n.local.RawTarget(role, model, index)
+	if !ok {
+		http.Error(w, "raw tunnel: no "+role+" replica #"+strconv.Itoa(index)+" (see GET /admin/replicas for live indices)", http.StatusNotFound)
+		return
+	}
+	base, err := url.Parse(target)
+	if err != nil {
+		http.Error(w, "raw tunnel: bad target url", http.StatusInternalServerError)
+		return
+	}
+	// {path...} captures the upstream path with no leading slash and already
+	// decoded; rebuild the forwarded request against the replica's base.
+	upstreamPath := "/" + r.PathValue("path")
+	q := r.URL.Query()
+	q.Del("model") // our routing param, not the upstream's
+	rawQuery := q.Encode()
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = base.Scheme
+			req.URL.Host = base.Host
+			req.URL.Path = upstreamPath
+			req.URL.RawPath = ""
+			req.URL.RawQuery = rawQuery
+			req.Host = base.Host
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			http.Error(w, "raw tunnel: upstream error: "+err.Error(), http.StatusBadGateway)
+		},
+	}
+	proxy.ServeHTTP(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

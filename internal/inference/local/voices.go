@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -17,10 +18,11 @@ import (
 //	GET  /v1/voices  -> {"voices":[...]}                 (names, or {name:...} objects)
 //	POST /v1/voices  (multipart name/transcript/voice)   201 created / 409 exists
 //
-// Voice registration FANS OUT to every live instance (decision #1): the cache is
-// per-process, so a voice must be uploaded to each replica. NOTE: a replica
-// launched AFTER an upload does NOT auto-receive it — re-upload the voice after
-// a scale-up (see .env.example / inferenced-unified-api-plan.md decision #1).
+// Voice registration FANS OUT to every live instance: the cache is per-process, so
+// a voice must be uploaded to each replica. Uploaded voices are also remembered in
+// the Engine (storedVoice) so a replica scaled up AFTER an upload is auto-provisioned
+// with the same voices as its neighbors on scale-up (see provisionVoices, called from
+// SetReplicas) — no manual re-upload needed.
 
 // VoiceUploadResult is the per-instance outcome of a fan-out voice upload.
 type VoiceUploadResult struct {
@@ -167,5 +169,39 @@ func (e *Engine) UploadVoice(ctx context.Context, name, transcript string, wav [
 	if ok == 0 {
 		return results, fmt.Errorf("voice %q rejected by all %d instance(s)", name, len(ws))
 	}
+	// Remember it so a tts replica scaled up later gets the same voices (crispasr
+	// caches per-process). Copy the wav — the caller's buffer may be reused.
+	e.rememberVoice(name, transcript, wav, filename)
 	return results, nil
+}
+
+// rememberVoice records a successfully-registered reference voice for later
+// scale-up replay. The wav is copied so the caller may reuse its buffer.
+func (e *Engine) rememberVoice(name, transcript string, wav []byte, filename string) {
+	cp := make([]byte, len(wav))
+	copy(cp, wav)
+	e.voiceMu.Lock()
+	defer e.voiceMu.Unlock()
+	if e.voices == nil {
+		e.voices = map[string]storedVoice{}
+	}
+	e.voices[name] = storedVoice{name: name, transcript: transcript, wav: cp, filename: filename}
+}
+
+// provisionVoices re-uploads every remembered reference voice to a single freshly
+// launched tts replica, so it matches its neighbors. Called from SetReplicas after a
+// tts scale-up. Best-effort: a failed replay is logged, not fatal — the scale-up
+// still succeeds, and a later Synthesize can still recover via the pool's retry.
+func (e *Engine) provisionVoices(ctx context.Context, url string) {
+	e.voiceMu.Lock()
+	pending := make([]storedVoice, 0, len(e.voices))
+	for _, v := range e.voices {
+		pending = append(pending, v)
+	}
+	e.voiceMu.Unlock()
+	for _, v := range pending {
+		if _, err := uploadVoiceTo(ctx, e.httpClient, url, e.cfg.TTSServerToken, v.name, v.transcript, v.wav, v.filename); err != nil {
+			log.Printf("[tts pool] scale-up voice replay of %q -> %s failed: %v", v.name, url, err)
+		}
+	}
 }

@@ -32,12 +32,16 @@ FROM rocm/dev-ubuntu-24.04:7.2.4
 ARG CRISPASR_ROCM_URL
 ARG LLAMACPP_ROCM_URL
 RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends ffmpeg wget ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg wget curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # Fetch + unpack the prebuilt ROCm bundles.
 #   crispasr.tgz  -> /opt/qv/rocm-mi300x/{crispasr, lib/*.so}
-#   llamacpp.tgz  -> /opt/qv/llamacpp/bin/{llama-server, llama-cli, *.so}
+#   llamacpp.tgz  -> /opt/qv/llamacpp/bin/{llama-server, llama-cli, llama-mtmd-cli, *.so}
+# ⚠️ The ENV paths below HARDCODE this layout (crispasr.tgz must contain a top-level
+# `rocm-mi300x/` dir; llamacpp.tgz's binaries must land in `bin/`). Verify with
+# `tar tzf <bundle>` before building — if either is packed flat, add --strip-components
+# or normalize here, else crispasr/llama-server won't exist at the expected path.
 WORKDIR /opt/qv
 RUN test -n "$CRISPASR_ROCM_URL" && test -n "$LLAMACPP_ROCM_URL" \
  && wget -qO crispasr.tgz "$CRISPASR_ROCM_URL" && tar xzf crispasr.tgz && rm crispasr.tgz \
@@ -57,12 +61,16 @@ ENV CRISPASR_BIN=${CRISPASR_DIR}/crispasr \
     TTS_LIB_DIR=${CRISPASR_DIR}/lib \
     GEMMA_SERVER_BIN=${LLAMA_DIR}/llama-server \
     GEMMA_LIB_DIR=${LLAMA_DIR} \
-    LLAMA_MTMD_BIN=llama-mtmd-cli \
     INFERENCE_LISTEN=:9095
-# NOTE: listen_voice's Interpret cold-spawns `llama-mtmd-cli`, which is NOT in the
-# current llamacpp bundle (it built only llama-server + llama-cli). `say` and ASR
-# work as-is; to enable Interpret, rebuild llama.cpp adding the `llama-mtmd-cli`
-# target and repack the bundle — it will then be on PATH (LLAMA_DIR) automatically.
+# On this PREMIUM node everything is HOT: with INFERENCE_ADMIN=1 the supervisor keeps
+# a `llama-server` Gemma replica resident, and Interpret (listen_voice) routes to it via
+# POST /v1/chat/completions (see internal/inference/local/gemmaserver.go, proven by
+# TestInterpretRoutesToHotGemma). So `llama-mtmd-cli` is NOT needed here — no cold-spawn.
+# (A cold-spawn fallback still exists for non-managed nodes; leave LLAMA_MTMD_BIN unset.)
+
+# boot-fabric.sh: the compose `boot` sidecar runs this to POST the premium fleet.
+COPY deploy/boot-fabric.sh /opt/qv/boot-fabric.sh
+RUN chmod +x /opt/qv/boot-fabric.sh
 
 COPY --from=build /out/inferenced /usr/local/bin/inferenced
 EXPOSE 9095

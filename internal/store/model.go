@@ -43,6 +43,12 @@ type Session struct {
 	TelegramChatID int64     `json:"telegram_chat_id,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	LastSeenAt     time.Time `json:"last_seen_at"`
+	// Voice is the TTS voice name assigned to this session by per-session voice
+	// rotation (VOICE_ROTATE). Assigned once (seeded deterministically from the
+	// session ID hashed into the node's voice pool) and then STICKY: it is never
+	// recomputed, so the pool growing/shrinking later only affects new sessions.
+	// Empty when rotation is off, or not yet assigned.
+	Voice string `json:"voice,omitempty"`
 }
 
 // VoiceRequest is created each time an agent calls listen_voice and blocks.

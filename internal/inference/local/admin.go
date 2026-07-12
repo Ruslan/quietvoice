@@ -3,7 +3,9 @@ package local
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -13,7 +15,8 @@ import (
 //   - tts:   qwen3-tts 1.7b ≈ 3304 MiB (the old 2100 undershot the real cost).
 //   - asr:   whisper-large ≈ 2000 MiB.
 //   - gemma: Gemma E4B Q4 ≈ 7000 MiB.
-// VRAM estimation for admission check.
+//
+// See inferenced-replication-plan.md / findings-2026-07-10.md.
 const (
 	ttsVRAMCostMB   = 3300
 	asrVRAMCostMB   = 2000
@@ -34,8 +37,12 @@ func roleVRAMCostMB(role string) int {
 
 // ReplicaStatus is one entry in the admin `GET /admin/replicas` listing.
 type ReplicaStatus struct {
-	Role    string `json:"role"`
-	Model   string `json:"model,omitempty"` // "" = default pool
+	Role  string `json:"role"`
+	Model string `json:"model,omitempty"` // "" = default pool
+	// Index is the 1-based position of this replica within its (role, model)
+	// pool, in ascending-port order. It is the stable handle the raw tunnel
+	// addresses: /raw/{role}/{index} -> this url (see Engine.RawTarget).
+	Index   int    `json:"index"`
 	URL     string `json:"url"`
 	PID     int    `json:"pid,omitempty"`
 	Managed bool   `json:"managed"` // false = external URL from config (cannot be scaled down)
@@ -116,6 +123,12 @@ func (e *Engine) SetReplicas(ctx context.Context, role, model string, n int) ([]
 			return e.Replicas(ctx), fmt.Errorf("launch %s replica: %w", canon, err)
 		}
 		p.add(&worker{url: r.url, role: canon, model: model, managed: true, pid: r.pid})
+		// Give the new tts replica the same reference voices as its neighbors —
+		// crispasr voice caches are per-process, so a replica born after the original
+		// upload fan-out would otherwise be voice-less until a manual re-upload.
+		if canon == "tts" {
+			e.provisionVoices(ctx, r.url)
+		}
 	}
 	for i := cur; i > n; i-- { // scale down
 		r := e.sup.stopLast(canon, model)
@@ -129,16 +142,24 @@ func (e *Engine) SetReplicas(ctx context.Context, role, model string, n int) ([]
 
 // Replicas returns the current pool membership across all roles and models (both
 // managed and external workers) with a live, role-appropriate health probe for
-// each (tts -> /v1/voices, asr/gemma -> /health).
+// each (tts -> /v1/voices, asr/gemma -> /health). The listing is stably ordered
+// by (role, model, ascending port) and carries each replica's 1-based per-pool
+// Index, so it doubles as the directory for the raw tunnel: the replica listed
+// with Index N in a (role, model) pool is the one /raw/{role}/{N} addresses.
 func (e *Engine) Replicas(ctx context.Context) []ReplicaStatus {
 	ws := e.allWorkers()
+	sortWorkers(ws)
 	out := make([]ReplicaStatus, 0, len(ws))
+	idx := map[poolKey]int{}
 	for _, w := range ws {
 		role := firstNonEmpty(w.role, "tts")
+		k := poolKey{role: role, model: w.model}
+		idx[k]++
 		healthy := healthGet(ctx, e.httpClient, joinURL(w.url, roleHealthPath(role)), e.cfg.TTSServerToken) == nil
 		out = append(out, ReplicaStatus{
 			Role:    role,
 			Model:   w.model,
+			Index:   idx[k],
 			URL:     w.url,
 			PID:     w.pid,
 			Managed: w.managed,
@@ -146,6 +167,58 @@ func (e *Engine) Replicas(ctx context.Context) []ReplicaStatus {
 		})
 	}
 	return out
+}
+
+// RawTarget resolves a (role, model, 1-based index) to the base URL of that
+// replica, for the raw pass-through tunnel (/raw/{role}/{index}/...). model ""
+// is the default pool. Replicas are ordered by ascending port so the index is
+// stable across calls and matches the Replicas() listing. ok is false for an
+// unknown role, a pool that was never created, or an out-of-range index.
+func (e *Engine) RawTarget(role, model string, index int) (string, bool) {
+	canon, err := normalizeRole(role)
+	if err != nil {
+		return "", false
+	}
+	p := e.lookupPool(canon, model)
+	if p == nil {
+		return "", false
+	}
+	ws := p.workers()
+	sortWorkers(ws)
+	if index < 1 || index > len(ws) {
+		return "", false
+	}
+	return ws[index-1].url, true
+}
+
+// sortWorkers orders a worker snapshot deterministically by (role, model, port)
+// so both the admin listing and RawTarget agree on which replica is "index N".
+func sortWorkers(ws []worker) {
+	sort.Slice(ws, func(i, j int) bool {
+		a, b := ws[i], ws[j]
+		if a.role != b.role {
+			return a.role < b.role
+		}
+		if a.model != b.model {
+			return a.model < b.model
+		}
+		return portFromURL(a.url) < portFromURL(b.url)
+	})
+}
+
+// portFromURL extracts the numeric port from a worker base URL (e.g.
+// "http://127.0.0.1:9101" -> 9101), or -1 if it has none/unparseable — enough
+// to give consecutively-launched replicas a natural, human-meaningful order.
+func portFromURL(raw string) int {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return -1
+	}
+	p, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return -1
+	}
+	return p
 }
 
 // Shutdown stops all managed replicas. Call on process exit so we don't leak

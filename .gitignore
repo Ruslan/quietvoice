@@ -16,3 +16,7 @@ voice_sessions/
 bin/
 
 .DS_Store
+
+# local MCP bootstrap + node env — hold real tokens
+quietvoice-mcp.env
+deploy/.env.mi300x

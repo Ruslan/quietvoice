@@ -28,14 +28,14 @@ func TestRemoteSynthesizeUsesOpenAISpeech(t *testing.T) {
 	defer srv.Close()
 
 	e := New(Config{BaseURL: srv.URL, WorkDir: t.TempDir()})
-	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "hello", Voice: "ded", Model: "qwen3-tts-1.7b"})
+	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "привет", Voice: "ded", Model: "qwen3-tts-1.7b"})
 	if err != nil {
 		t.Fatalf("Synthesize: %v", err)
 	}
 	if gotPath != inference.RouteSpeech {
 		t.Fatalf("posted to %q, want %q", gotPath, inference.RouteSpeech)
 	}
-	if gotBody.Input != "hello" || gotBody.Voice != "ded" || gotBody.Model != "qwen3-tts-1.7b" {
+	if gotBody.Input != "привет" || gotBody.Voice != "ded" || gotBody.Model != "qwen3-tts-1.7b" {
 		t.Fatalf("unexpected OpenAI body: %+v", gotBody)
 	}
 	if gotBody.ResponseFormat != "wav" {

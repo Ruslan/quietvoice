@@ -70,7 +70,8 @@ type Config struct {
 	// TTSModelPaths maps a model name (the request's `model` field / a pool key)
 	// to the gguf path the supervisor launches for it. When a launched model has
 	// no entry here the launcher falls back to TTSModel — so a single-model node
-	// works with an empty map, while a multi-model node declares its models.
+	// works with an empty map, while a multi-model node declares its models. See
+	// decision #2 (model-aware routing) in inferenced-unified-api-plan.md.
 	TTSModelPaths map[string]string
 
 	// Gemma 4 multimodal (llama.cpp) for intent/clean_text interpretation.
@@ -90,11 +91,25 @@ type Config struct {
 	Lang string
 }
 
-// Recognizer is one dedicated ASR: a crispasr model plus its backend.
+// Recognizer is one dedicated ASR: a crispasr model plus its backend. Name doubles
+// as the model-keyed asr pool key: an admin launch of `?model=<Name>` and the
+// ensemble's pickASRPool(rec.Name) must agree on it.
 type Recognizer struct {
-	Name    string // label shown to Gemma, e.g. "voxtral", "whisper-large"
+	Name    string // label shown to Gemma AND the asr pool key, e.g. "voxtral", "whisper-large"
 	Model   string // path to the gguf/bin model
 	Backend string // crispasr backend, e.g. "voxtral4b" or "whisper"
+}
+
+// recognizerByName finds a configured recognizer by its logical name (the asr pool
+// key the supervisor launches and the ensemble routes to). Returns false when none
+// matches.
+func recognizerByName(recs []Recognizer, name string) (Recognizer, bool) {
+	for _, r := range recs {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return Recognizer{}, false
 }
 
 // Transcript is one recognizer's output for a piece of audio.
@@ -124,6 +139,21 @@ type Engine struct {
 
 	sup        *supervisor // process supervisor for admin-managed replicas
 	freeVRAMMB func() int  // VRAM admission probe; overridable in tests
+
+	// voices retains the reference voices uploaded via UploadVoice so a tts replica
+	// scaled up LATER can be given the same voices as its neighbors. crispasr voice
+	// caches are per-process, so a replica born after the original fan-out would
+	// otherwise have none until a manual re-upload.
+	voiceMu sync.Mutex
+	voices  map[string]storedVoice
+}
+
+// storedVoice is a reference voice kept in memory for scale-up replay.
+type storedVoice struct {
+	name       string
+	transcript string
+	wav        []byte
+	filename   string
 }
 
 // New returns a local Engine, applying defaults for unset fields.
@@ -135,7 +165,7 @@ func New(cfg Config) *Engine {
 		cfg.LlamaMtmdBin = "llama-mtmd-cli"
 	}
 	if cfg.Lang == "" {
-		cfg.Lang = "ru"
+		cfg.Lang = "auto" // detect language rather than forcing one; control plane can still pin per request
 	}
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = os.TempDir()
@@ -478,7 +508,7 @@ func (e *Engine) Interpret(ctx context.Context, in inference.AudioInput, req inf
 
 	switch req.Mode {
 	case inference.ModeLiteral:
-		transcripts := e.runRecognizers(ctx, wav)
+		transcripts := e.runRecognizers(ctx, wav, e.langFor(req))
 		if len(transcripts) == 0 {
 			return nil, fmt.Errorf("interpret(literal): no ASR produced a transcript")
 		}
@@ -587,10 +617,20 @@ func (e *Engine) pickRecognizer(model string) (Recognizer, error) {
 	return Recognizer{}, fmt.Errorf("transcribe: no ASR recognizer for model %q", model)
 }
 
-// asrTranscript runs one recognizer for a faithful transcript, using the
-// engine's configured language hint.
-func (e *Engine) asrTranscript(ctx context.Context, wav string, rec Recognizer) (string, error) {
-	return e.asrTranscriptLang(ctx, wav, rec, e.cfg.Lang)
+// langFor picks the ASR language hint for a request: the per-request Language
+// the control plane forwarded (when set), else the node's configured default.
+// This is where "language lives in the control plane" is enforced.
+func (e *Engine) langFor(req inference.InterpretRequest) string {
+	if l := strings.TrimSpace(req.Language); l != "" {
+		return l
+	}
+	return e.cfg.Lang
+}
+
+// asrTranscript runs one recognizer for a faithful transcript with the given
+// language hint (empty => the recognizer's own default / auto-detect).
+func (e *Engine) asrTranscript(ctx context.Context, wav string, rec Recognizer, lang string) (string, error) {
+	return e.asrTranscriptLang(ctx, wav, rec, lang)
 }
 
 // asrTranscriptLang runs one recognizer with an explicit language hint. When a
@@ -600,11 +640,12 @@ func (e *Engine) asrTranscript(ctx context.Context, wav string, rec Recognizer) 
 // single hot whisper lives). With no live asr pool it cold-spawns the crispasr CLI
 // recognizer (the monolith fallback — unchanged).
 func (e *Engine) asrTranscriptLang(ctx context.Context, wav string, rec Recognizer, lang string) (string, error) {
-	// Hot path: the ensemble hits the same hot asr pool Transcribe uses. rec.Model
-	// is a file path (won't match a model-keyed pool today), so pickASRPool falls
-	// through to the default ("") pool — correct for the single-whisper setup, and
-	// forward-compatible with a model-keyed whisper+voxtral hot ensemble.
-	if p := e.pickASRPool(rec.Model); p != nil {
+	// Hot path: route by rec.Name — the model-keyed asr pool key an admin launch
+	// uses (e.g. "voxtral", "whisper-large"). A recognizer whose named pool isn't up
+	// falls through pickASRPool to the default ("") pool, so a single-whisper node
+	// still serves the whole ensemble; when Voxtral and Whisper are each launched as
+	// their own hot pool, this routes each leg to the right model.
+	if p := e.pickASRPool(rec.Name); p != nil {
 		return e.asrTranscriptServer(ctx, p, wav, rec, lang)
 	}
 	// CLI fallback (unchanged): cold-spawn the crispasr recognizer on the 16k WAV.
@@ -676,14 +717,14 @@ func (e *Engine) asrTranscriptServer(ctx context.Context, p *pool, wav string, r
 
 // runRecognizers transcribes the audio with every configured recognizer in
 // parallel and returns the non-empty transcripts (order follows cfg.Recognizers).
-func (e *Engine) runRecognizers(ctx context.Context, wav string) []Transcript {
+func (e *Engine) runRecognizers(ctx context.Context, wav, lang string) []Transcript {
 	results := make([]Transcript, len(e.cfg.Recognizers))
 	var wg sync.WaitGroup
 	for i, rec := range e.cfg.Recognizers {
 		wg.Add(1)
 		go func(i int, rec Recognizer) {
 			defer wg.Done()
-			text, err := e.asrTranscript(ctx, wav, rec)
+			text, err := e.asrTranscript(ctx, wav, rec, lang)
 			if err != nil {
 				log.Printf("[assisted] %s failed: %v", rec.Name, err)
 				return
@@ -707,7 +748,7 @@ func (e *Engine) runRecognizers(ctx context.Context, wav string) []Transcript {
 // transcript to Gemma to reconcile. Falls back to audio-only Gemma if no
 // recognizer produced a transcript.
 func (e *Engine) interpretAssisted(ctx context.Context, wav string, req inference.InterpretRequest) (*inference.InterpretResult, error) {
-	transcripts := e.runRecognizers(ctx, wav)
+	transcripts := e.runRecognizers(ctx, wav, e.langFor(req))
 	if len(transcripts) == 0 {
 		log.Printf("[assisted] no transcripts; falling back to Gemma audio-only")
 	}
@@ -740,8 +781,8 @@ func (e *Engine) interpretGemma(ctx context.Context, wav string, req inference.I
 		"--jinja", // Gemma's chat template requires the jinja template engine
 		"-sys", systemPrompt,
 		"-p", userPrompt,
-		"-n", "1536", // room for Gemma's reasoning block PLUS the final answer (512 got eaten by reasoning alone)
-		"--temp", "0.2",
+		"-n", "3072", // room for Gemma's reasoning block PLUS a COMPLETE (non-summarized) answer
+		"--temp", "0", // determinism (fidelity mode); matches gemmaChatServer
 	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -749,14 +790,10 @@ func (e *Engine) interpretGemma(ctx context.Context, wav string, req inference.I
 	if err != nil {
 		return nil, fmt.Errorf("interpret: llama-mtmd-cli failed: %w: %s", err, tail(stderr.String()))
 	}
-	text := extractGemmaFinal(out)
-	log.Printf("[gemma] interpreted %d bytes of output into a %d-char intent (transcripts=%d)", len(out), len(text), len(refs))
-	if text == "" {
+	result := finalizeInterpret(string(out), refs)
+	log.Printf("[gemma] interpreted %d bytes of output into a %d-char intent (transcripts=%d)", len(out), len(result.Intent), len(refs))
+	if result.Intent == "" {
 		return nil, fmt.Errorf("interpret: Gemma returned empty output")
-	}
-	result := &inference.InterpretResult{Type: "intent", Intent: text, Raw: string(out), Transcripts: toRefs(refs)}
-	if len(refs) > 0 {
-		result.Type = "assisted-intent"
 	}
 	return result, nil
 }
@@ -834,16 +871,104 @@ func (e *Engine) interpretGemmaServer(ctx context.Context, p *pool, wav, userPro
 // whitespace) it falls back to the raw content. Raw carries the exact content
 // returned; the Type/assisted-intent logic is identical to the CLI path.
 func interpretResultFromContent(raw string, refs []Transcript) *inference.InterpretResult {
-	text := extractGemmaFinal([]byte(raw))
-	if text == "" {
-		text = strings.TrimSpace(raw)
-	}
-	log.Printf("[gemma pool] interpreted %d bytes of content into a %d-char intent (transcripts=%d)", len(raw), len(text), len(refs))
-	result := &inference.InterpretResult{Type: "intent", Intent: text, Raw: raw, Transcripts: toRefs(refs)}
-	if len(refs) > 0 {
-		result.Type = "assisted-intent"
-	}
+	result := finalizeInterpret(raw, refs)
+	log.Printf("[gemma pool] interpreted %d bytes of content into a %d-char intent (transcripts=%d)", len(raw), len(result.Intent), len(refs))
 	return result
+}
+
+// finalizeInterpret builds the InterpretResult from Gemma's RAW output. It first
+// pulls the best-effort trailing type/tone/urgency metadata line out (stripMetaLine),
+// THEN runs extractGemmaFinal on the remainder — this order matters: extractGemmaFinal's
+// no-marker fallback returns the last content line, so a trailing meta line must be
+// removed before it, or the tags would masquerade as the answer. Type is the utterance
+// classification when the model gave one; empty otherwise (the mode of computation is
+// already recorded by the eval log's Mode + the presence of Transcripts).
+func finalizeInterpret(raw string, refs []Transcript) *inference.InterpretResult {
+	cleaned, typ, tone, urgency := stripMetaLine(raw)
+	text := extractGemmaFinal([]byte(cleaned))
+	if text == "" {
+		text = strings.TrimSpace(cleaned)
+	}
+	return &inference.InterpretResult{
+		Type:        typ,
+		Intent:      text,
+		Tone:        tone,
+		Urgency:     urgency,
+		Raw:         raw,
+		Transcripts: toRefs(refs),
+	}
+}
+
+// stripMetaLine removes Gemma's trailing "[[type: … | tone: … | urgency: …]]" metadata
+// line from the full model output and returns the cleaned text plus the parsed fields.
+// It is DELIBERATELY LENIENT: a small, heavily-quantized Gemma routinely mangles the
+// format — wrong brackets, ':' vs '=', '|' vs '·' vs ';', a missing field, or the line
+// dropped entirely. We look only at the last couple of non-empty lines, accept a line
+// as metadata only if it yields a tone or urgency value (the strong signals — `type`
+// alone is too easily confused with prose like "what type of file"), grab `type`
+// opportunistically from that same line, and strip just that line. If no meta line is
+// found the text is returned unchanged with empty fields.
+func stripMetaLine(raw string) (cleaned, typ, tone, urgency string) {
+	trimmed := strings.TrimRight(raw, " \t\r\n")
+	lines := strings.Split(trimmed, "\n")
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-2; i-- {
+		low := strings.ToLower(lines[i])
+		if !strings.Contains(low, "tone") && !strings.Contains(low, "urgency") {
+			continue
+		}
+		t := metaTagValue(lines[i], "tone")
+		u := metaTagValue(lines[i], "urgency")
+		if t == "" && u == "" {
+			continue
+		}
+		ty := normalizeType(metaTagValue(lines[i], "type"))
+		rest := strings.Join(append(append([]string{}, lines[:i]...), lines[i+1:]...), "\n")
+		return rest, ty, t, u
+	}
+	return raw, "", "", ""
+}
+
+// normalizeType lowercases the parsed utterance type and keeps it only if it is one
+// of the documented classes; anything else (a hallucinated or mangled value) is
+// dropped to "" rather than surfaced.
+func normalizeType(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "command", "question", "decision", "suggestion", "hypothesis", "uncertain":
+		return v
+	default:
+		return ""
+	}
+}
+
+// metaTagValue pulls the value following `key` on a loose metadata line, tolerating
+// ':' or '=' separators and stopping at the next field/closing delimiter. The key
+// must appear on a WORD BOUNDARY so ordinary prose ("ringtone", "tonely") does not
+// masquerade as a "tone" tag. Returns "" if no boundary occurrence is found.
+func metaTagValue(line, key string) string {
+	low := strings.ToLower(line)
+	for start := 0; ; {
+		rel := strings.Index(low[start:], key)
+		if rel < 0 {
+			return ""
+		}
+		idx := start + rel
+		if idx == 0 || !isAlnumByte(low[idx-1]) {
+			rest := strings.TrimLeft(line[idx+len(key):], " \t:=")
+			for i, r := range rest {
+				if r == '|' || r == '·' || r == ';' || r == ',' || r == ']' || r == '\n' || r == '⟧' {
+					rest = rest[:i]
+					break
+				}
+			}
+			return strings.TrimSpace(strings.Trim(strings.TrimSpace(rest), "\"'`[]"))
+		}
+		start = idx + len(key)
+	}
+}
+
+func isAlnumByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 // toRefs converts internal transcripts to the wire/logging shape.
@@ -912,25 +1037,54 @@ func buildUserPrompt(req inference.InterpretRequest, refs []Transcript) string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("USER AUDIO follows. Return concise agent-ready text.")
+	b.WriteString("USER AUDIO follows. Return COMPLETE, faithful agent-ready text — preserve everything the user says, do not summarize.")
 	return b.String()
 }
 
 // systemPrompt is the speech-to-intent interpreter instruction (handoff §14).
-const systemPrompt = `You are a speech-to-intent interpreter for an AI coding agent.
-Convert the user's spoken message into concise, agent-ready text.
+// FIDELITY-FIRST (2026-07-11): the earlier "concise, ~100 tokens, do not transcribe
+// verbatim" wording made Gemma summarize and DROP content (whole asides, one side of a
+// comparison) — see doc/eval-listen-gemma-drops-meaning.md. The rule is now: preserve
+// everything the user said; clean recognition noise only; never compress.
+// EMOTION (2026-07-11): fold audible tone into the text as inline cues (CAPS for anger/
+// swearing, "(laughs)" for laughter, "(emphatic)" for stressed repetition). This is what
+// makes voice-in beat plain ASR: users of text-only voice tools fake emotion by hand
+// (swearing, typing laughter, repeating themselves) because tone is discarded
+// (doc/validation-voice-emotion-need.md). Cues augment the words, never replace them. The
+// model also emits a trailing "[[tone: … | urgency: …]]" line, parsed leniently by
+// splitEmotionMeta into InterpretResult.Tone/Urgency for the agent-facing marker.
+const systemPrompt = `You are a faithful speech-to-intent interpreter for an AI coding agent.
+Turn the user's spoken message into clean, COMPLETE, agent-ready text.
+FIDELITY IS THE PRIORITY: never summarize, shorten, or drop anything the user actually said.
 Rules:
-- Do not transcribe verbatim unless exact wording is necessary.
-- Preserve the user's actual intent; do not improve their decision.
+- Preserve EVERY distinct point, question, aside, and observation — including remarks that
+  seem minor or off-topic. Do not omit content to be concise.
+- Keep the user's actual intent and decisions exactly; do not improve, escalate, or soften them.
 - Do not convert suggestions into commands or questions into statements.
 - Preserve uncertainty, alternatives, and uncertain recollections.
+- When REFERENCE TRANSCRIPTS are provided, treat their wording as authoritative for technical
+  terms, tool names, identifiers, and numbers; never replace a term from them with a different
+  word. If a technical identifier is unclear, mark it uncertain rather than guessing.
 - Do not invent file names, class names, identifiers, paths, or numbers.
-- When a REFERENCE TRANSCRIPT is provided, treat its wording as authoritative for
-  technical terms and names; never replace a term from it with a different word.
-- If a technical identifier is unclear, mark it as uncertain.
-- Remove filler words, repetitions, and false starts; keep meaningful self-corrections.
+- Clean up only recognition noise: filler words, repetitions, and false starts; keep meaningful
+  self-corrections. You may reorder into readable sentences, but change no meaning and lose nothing.
 - Reply in the same language the user spoke.
-- Return concise text suitable as input to a coding agent (max ~100 tokens).`
+- Convey emotional delivery from the AUDIO — hearing the voice is the whole point, not just reading
+  a transcript. Fold tone into the text as light cues; a cue must NEVER replace or drop a word the
+  user actually said:
+  - Anger, frustration, or swearing: RENDER THE HEATED WORDS IN CAPS (keep the words themselves).
+  - Laughter: mark it where it happens, e.g. "(laughs)" / "(смеётся)".
+  - Emphasis the user makes by repeating a point or raising their voice: keep every repetition and
+    note the emphasis, e.g. "(emphatic)".
+  - Preserve audible sarcasm, hesitation, and excitement as short parenthetical cues.
+  - When delivery is calm and neutral, add no cues — do not invent emotion that is not there.
+- Length follows the input: a long spoken message yields a long, complete result. Do not compress.
+- AFTER the interpreted text, output ONE final line, by itself, in exactly this form:
+  [[type: <command|question|decision|suggestion|hypothesis|uncertain> | tone: <one or two words> | urgency: <low|normal|high>]]
+  Choose type by what the utterance DOES; judge tone and urgency from the AUDIO delivery (calm speech
+  → tone: neutral | urgency: low). Emit this line exactly once, at the very end, and write nothing
+  after it. This line is metadata, not part of the message — do not let it change the interpreted
+  text above it.`
 
 // extractGemmaFinal pulls the final answer out of Gemma E4B's output. The model
 // emits a "<|channel>thought …" reasoning block and then the final answer after

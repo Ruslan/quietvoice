@@ -1,0 +1,69 @@
+# QuietVoice — AMD MI300X PREMIUM inference node.
+#
+# One command brings up the whole hot fleet:
+#     docker compose -f deploy/docker-compose.mi300x.yml up -d --build
+#
+# `inferenced-mi300x` boots the supervisor; the `boot` sidecar waits for it to be
+# healthy, then POSTs the premium fleet (3x tts + 1x whisper + 1x Gemma-12B) and
+# polls each replica to healthy. Rehearses the deploy loop we'll do for real:
+#     rsync (≈ git pull the synced public source)  →  docker compose up
+#
+# Prereqs on the host:
+#   • ROCm 7.2.4 / gfx942, /dev/kfd + /dev/dri present, user in video+render groups.
+#   • Prebuilt ROCm bundles on a CDN (CRISPASR_ROCM_URL / LLAMACPP_ROCM_URL) — see Dockerfile.
+#   • Models at $MODELS_DIR (default /workspace/models); voices at $VOICES_DIR.
+#   • deploy/.env.mi300x present — `make mi300x` auto-copies it from .env.demo-example if missing.
+
+name: quietvoice-mi300x
+
+services:
+  inferenced-mi300x:
+    image: quietvoice-inferenced-mi300x
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.inferenced-mi300x
+      args:
+        CRISPASR_ROCM_URL: ${CRISPASR_ROCM_URL:?set CRISPASR_ROCM_URL}
+        LLAMACPP_ROCM_URL: ${LLAMACPP_ROCM_URL:?set LLAMACPP_ROCM_URL}
+    env_file: .env.mi300x
+    ports:
+      - "9095:9095"
+    volumes:
+      - ${MODELS_DIR:-/workspace/models}:/models:ro
+      - ${VOICES_DIR:-/workspace/voices}:/voices
+    # --- ROCm GPU access (mirrors the docker run flags in the Dockerfile header) ---
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    ipc: host              # required: HIP uses large SVM/IPC handles (AMD's own recipes use --ipc=host)
+    security_opt:
+      - seccomp:unconfined # AMD-recipe default; try removing if no syscall is actually blocked
+    healthcheck:
+      # MUST be the AUTHLESS /healthz — /v1/voices is behind the bearer token, so a
+      # header-less wget gets 401 forever and the container never becomes healthy
+      # (which would gate the boot sidecar and leave the pools empty). /healthz checks
+      # the crispasr binary + TTS model/codec files exist and returns 200 fast.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9095/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 40          # generous; the real Gemma load wait is inside the boot POST, not here
+      start_period: 30s
+    restart: unless-stopped
+
+  # One-shot: bring up the premium fleet once inferenced is healthy, then exit 0.
+  boot:
+    image: quietvoice-inferenced-mi300x    # reuse the image (has curl + boot-fabric.sh)
+    depends_on:
+      inferenced-mi300x:
+        condition: service_healthy
+    env_file: .env.mi300x
+    environment:
+      BASE: http://inferenced-mi300x:9095   # reach the sibling service by name
+    volumes:
+      - ${VOICES_DIR:-/workspace/voices}:/voices:ro   # so boot-fabric can POST the voice pack
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["/opt/qv/boot-fabric.sh"]
+    restart: "no"

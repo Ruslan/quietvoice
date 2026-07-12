@@ -91,7 +91,7 @@ func TestUploadVoiceFansOutToAllInstances(t *testing.T) {
 	c := newVoiceServer(t)
 	e := newExternalEngine(t, a, b, c)
 
-	results, err := e.UploadVoice(context.Background(), "ded", "hello", []byte("RIFFref"), "ded.wav")
+	results, err := e.UploadVoice(context.Background(), "ded", "привет", []byte("RIFFref"), "ded.wav")
 	if err != nil {
 		t.Fatalf("UploadVoice: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestUploadVoiceFansOutToAllInstances(t *testing.T) {
 	}
 
 	// Re-upload is idempotent: every instance now answers 409, still success.
-	results, err = e.UploadVoice(context.Background(), "ded", "hello", []byte("RIFFref"), "ded.wav")
+	results, err = e.UploadVoice(context.Background(), "ded", "привет", []byte("RIFFref"), "ded.wav")
 	if err != nil {
 		t.Fatalf("idempotent re-upload: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestOpenAISpeechRoundTripThroughPool(t *testing.T) {
 	a := newVoiceServer(t)
 	e := newExternalEngine(t, a)
 
-	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "hello world"})
+	res, err := e.Synthesize(context.Background(), inference.SynthesizeRequest{Text: "привет мир"})
 	if err != nil {
 		t.Fatalf("Synthesize through pool: %v", err)
 	}

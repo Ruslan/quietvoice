@@ -166,24 +166,34 @@ func (e *Engine) EnsureVoice(ctx context.Context) error {
 
 // hasVoice reports whether name is already registered on the node.
 func (e *Engine) hasVoice(ctx context.Context, name string) (bool, error) {
-	resp, err := e.do(ctx, http.MethodGet, inference.RouteVoices, nil, "")
+	voices, err := e.ListVoices(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("list voices: status %d", resp.StatusCode)
-	}
-	var vr inference.VoicesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&vr); err != nil {
-		return false, err
-	}
-	for _, v := range vr.Voices {
+	for _, v := range voices {
 		if v == name {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// ListVoices returns the voice names registered on the node (implements
+// inference.VoiceLister, used by per-session voice rotation).
+func (e *Engine) ListVoices(ctx context.Context) ([]string, error) {
+	resp, err := e.do(ctx, http.MethodGet, inference.RouteVoices, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list voices: status %d", resp.StatusCode)
+	}
+	var vr inference.VoicesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&vr); err != nil {
+		return nil, err
+	}
+	return vr.Voices, nil
 }
 
 // uploadVoice POSTs the reference wav + transcript to /v1/voices (multipart

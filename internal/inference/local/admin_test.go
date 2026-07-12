@@ -51,7 +51,7 @@ func newFakeReplicaServer(t *testing.T, wav []byte) *httptest.Server {
 	})
 	mux.HandleFunc("POST /v1/audio/transcriptions", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"text": "spin up"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"text": "стартуют"})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

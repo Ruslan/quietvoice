@@ -66,7 +66,9 @@ func main() {
 		SayContextCount: cfg.SayContextCount,
 		WorkDir:         cfg.WorkDir,
 		ListenMode:      listenMode,
+		ASRLang:         cfg.Lang, // forwarded per-request to the node (default "auto")
 		EvalLogPath:     cfg.EvalLogPath,
+		VoiceRotate:     cfg.VoiceRotate,
 	}, st, eng, bot)
 	log.Printf("listen mode: %s", listenMode)
 

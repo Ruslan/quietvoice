@@ -39,17 +39,17 @@ func TestTranscribeRoutesToHotASR(t *testing.T) {
 	}
 
 	// Hot path: a live asr server answers, no CLI involved.
-	srv := newFakeReplicaServer(t, []byte("RIFFx")) // its /v1/audio/transcriptions returns "spin up"
+	srv := newFakeReplicaServer(t, []byte("RIFFx")) // its /v1/audio/transcriptions returns "стартуют"
 	e := New(Config{WorkDir: t.TempDir()})
 	e.httpClient = srv.Client()
 	e.ensurePool("asr", "").add(&worker{url: srv.URL, role: "asr", managed: true})
 
-	got, err := e.Transcribe(context.Background(), audioFile, "", "en")
+	got, err := e.Transcribe(context.Background(), audioFile, "", "ru")
 	if err != nil {
 		t.Fatalf("Transcribe (hot asr): %v", err)
 	}
-	if got != "spin up" {
-		t.Fatalf("hot asr transcript = %q, want %q", got, "spin up")
+	if got != "стартуют" {
+		t.Fatalf("hot asr transcript = %q, want %q", got, "стартуют")
 	}
 
 	// CLI fallback: no asr pool -> cold-spawn the crispasr CLI (via the fake bin),
@@ -64,11 +64,11 @@ func TestTranscribeRoutesToHotASR(t *testing.T) {
 		CrispasrBin: bin,
 		Recognizers: []Recognizer{{Name: "whisper-large", Model: "/m/whisper.bin", Backend: "whisper"}},
 	})
-	got2, err := e2.Transcribe(context.Background(), audioFile, "", "en")
+	got2, err := e2.Transcribe(context.Background(), audioFile, "", "ru")
 	if err != nil {
 		t.Fatalf("Transcribe (CLI fallback): %v", err)
 	}
-	if !strings.Contains(got2, "spin up") || !strings.Contains(got2, "lang=en") {
+	if !strings.Contains(got2, "стартуют") || !strings.Contains(got2, "lang=ru") {
 		t.Fatalf("CLI transcript = %q, want the spoken term + forwarded lang", got2)
 	}
 }
@@ -82,7 +82,7 @@ func writeFakeCrispasr(t *testing.T) string {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "crispasr")
 	script := "#!/bin/sh\n" +
-		"lang=en\n" +
+		"lang=ru\n" +
 		"while [ $# -gt 0 ]; do\n" +
 		"  case \"$1\" in\n" +
 		"    -l) lang=\"$2\"; shift 2;;\n" +
@@ -90,7 +90,7 @@ func writeFakeCrispasr(t *testing.T) string {
 		"  esac\n" +
 		"done\n" +
 		"echo 'whisper_init: loading model'\n" +
-		"echo \"spin up lang=$lang\"\n"
+		"echo \"стартуют lang=$lang\"\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -99,15 +99,16 @@ func writeFakeCrispasr(t *testing.T) string {
 
 // TestRunRecognizersRoutesToHotASR proves the assisted-mode ensemble routes each
 // recognizer to the hot asr pool over HTTP (POST /v1/audio/transcriptions) instead
-// of cold-spawning the crispasr CLI. The recognizer's model is a file path, so it
-// falls through pickASRPool to the default ("") asr pool where the hot whisper lives.
+// of cold-spawning the crispasr CLI. Only the default ("") asr pool is up here, so
+// routing by rec.Name ("whisper-large") misses its named pool and falls through
+// pickASRPool to the default pool where the hot whisper lives.
 func TestRunRecognizersRoutesToHotASR(t *testing.T) {
 	wav := filepath.Join(t.TempDir(), "asr.wav")
 	if err := os.WriteFile(wav, []byte("RIFFsomeaudio"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	srv := newFakeReplicaServer(t, []byte("RIFFx")) // /v1/audio/transcriptions -> "spin up"
+	srv := newFakeReplicaServer(t, []byte("RIFFx")) // /v1/audio/transcriptions -> "стартуют"
 	// CrispasrBin points at a binary that does NOT exist: if the ensemble tried to
 	// cold-spawn instead of using the hot pool, the transcript would be empty.
 	e := New(Config{
@@ -118,9 +119,9 @@ func TestRunRecognizersRoutesToHotASR(t *testing.T) {
 	e.httpClient = srv.Client()
 	e.ensurePool("asr", "").add(&worker{url: srv.URL, role: "asr", managed: true})
 
-	got := e.runRecognizers(context.Background(), wav)
-	if len(got) != 1 || got[0].Text != "spin up" {
-		t.Fatalf("runRecognizers (hot asr) = %+v, want one transcript %q", got, "spin up")
+	got := e.runRecognizers(context.Background(), wav, "auto")
+	if len(got) != 1 || got[0].Text != "стартуют" {
+		t.Fatalf("runRecognizers (hot asr) = %+v, want one transcript %q", got, "стартуют")
 	}
 }
 
@@ -135,11 +136,11 @@ func TestRunRecognizersColdSpawnFallback(t *testing.T) {
 	e := New(Config{
 		WorkDir:     t.TempDir(),
 		CrispasrBin: bin,
-		Lang:        "en",
+		Lang:        "ru",
 		Recognizers: []Recognizer{{Name: "whisper-large", Model: "/m/whisper.bin", Backend: "whisper"}},
 	})
-	got := e.runRecognizers(context.Background(), wav)
-	if len(got) != 1 || !strings.Contains(got[0].Text, "spin up") || !strings.Contains(got[0].Text, "lang=en") {
+	got := e.runRecognizers(context.Background(), wav, "ru") // explicit hint forwarded to the CLI
+	if len(got) != 1 || !strings.Contains(got[0].Text, "стартуют") || !strings.Contains(got[0].Text, "lang=ru") {
 		t.Fatalf("runRecognizers (CLI fallback) = %+v, want the spoken term + forwarded lang", got)
 	}
 }
@@ -151,7 +152,7 @@ func TestASRTranscriptServerFailover(t *testing.T) {
 	if err := os.WriteFile(wav, []byte("RIFFsomeaudio"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	live := newFakeReplicaServer(t, []byte("RIFFx")) // -> "spin up"
+	live := newFakeReplicaServer(t, []byte("RIFFx")) // -> "стартуют"
 
 	// A dead worker: a URL whose server is already closed, so a dial fails (evict).
 	dead := httptest.NewServer(http.NewServeMux())
@@ -165,12 +166,12 @@ func TestASRTranscriptServerFailover(t *testing.T) {
 	p.add(&worker{url: live.URL, role: "asr", managed: true})
 
 	rec := Recognizer{Name: "whisper-large", Model: "/m/whisper.bin", Backend: "whisper"}
-	got, err := e.asrTranscriptLang(context.Background(), wav, rec, "en")
+	got, err := e.asrTranscriptLang(context.Background(), wav, rec, "ru")
 	if err != nil {
 		t.Fatalf("asrTranscriptLang failover: %v", err)
 	}
-	if got != "spin up" {
-		t.Fatalf("failover transcript = %q, want %q", got, "spin up")
+	if got != "стартуют" {
+		t.Fatalf("failover transcript = %q, want %q", got, "стартуют")
 	}
 	if got := e.poolSize("asr", ""); got != 1 {
 		t.Fatalf("asr pool size after evicting dead worker = %d, want 1", got)
@@ -269,17 +270,17 @@ func TestASRTranscriptViaCLI(t *testing.T) {
 	e := New(Config{WorkDir: t.TempDir(), CrispasrBin: bin})
 	rec := Recognizer{Name: "voxtral", Model: "/m/voxtral.gguf", Backend: "voxtral4b"}
 
-	got, err := e.asrTranscriptLang(context.Background(), "/tmp/audio.wav", rec, "en")
+	got, err := e.asrTranscriptLang(context.Background(), "/tmp/audio.wav", rec, "ru")
 	if err != nil {
 		t.Fatalf("asrTranscriptLang: %v", err)
 	}
 	// The fake echoes the -l value plus a fixed transcript, and prepends a noise
 	// line that cleanCLIOutput must drop.
-	if !strings.Contains(got, "spin up") {
+	if !strings.Contains(got, "стартуют") {
 		t.Fatalf("transcript = %q, want the spoken term", got)
 	}
-	if !strings.Contains(got, "lang=en") {
-		t.Fatalf("transcript = %q, want the forwarded language hint lang=en", got)
+	if !strings.Contains(got, "lang=ru") {
+		t.Fatalf("transcript = %q, want the forwarded language hint lang=ru", got)
 	}
 	if strings.Contains(got, "whisper_init") {
 		t.Fatalf("transcript = %q, log noise was not stripped", got)

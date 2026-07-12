@@ -103,8 +103,9 @@ func TestInterpretRoutesToHotGemma(t *testing.T) {
 	for _, mode := range []gemmaContentMode{contentString, contentArray} {
 		in := writeFakeAudioInput(t)
 		sawAudio := false
-		// A gemma-style answer with a thought block; extractGemmaFinal must strip it.
-		content := "<|channel>thought\nreasoning...<channel|>Run the tests then deploy."
+		// A gemma-style answer with a thought block (extractGemmaFinal must strip it)
+		// and a trailing metadata line (splitInterpretMeta must pull it into fields).
+		content := "<|channel>thought\nreasoning...<channel|>Run the tests then deploy.\n[[type: command | tone: neutral | urgency: high]]"
 		srv := newFakeGemmaServer(t, content, mode, &sawAudio)
 
 		e := New(Config{WorkDir: t.TempDir()})
@@ -119,10 +120,10 @@ func TestInterpretRoutesToHotGemma(t *testing.T) {
 			t.Fatal("gemma server did not receive an input_audio part")
 		}
 		if res.Intent != "Run the tests then deploy." {
-			t.Fatalf("intent = %q, want extracted final answer", res.Intent)
+			t.Fatalf("intent = %q, want extracted final answer (meta line stripped)", res.Intent)
 		}
-		if res.Type != "intent" {
-			t.Fatalf("type = %q, want intent (no refs)", res.Type)
+		if res.Type != "command" || res.Tone != "neutral" || res.Urgency != "high" {
+			t.Fatalf("structure = {type:%q tone:%q urgency:%q}, want {command neutral high}", res.Type, res.Tone, res.Urgency)
 		}
 		if res.Raw != content {
 			t.Fatalf("raw = %q, want the raw content %q", res.Raw, content)
@@ -132,11 +133,11 @@ func TestInterpretRoutesToHotGemma(t *testing.T) {
 
 // TestInterpretAssistedRoutesToHotGemma proves the assisted path (ASR ensemble +
 // Gemma reconcile) also routes to the hot gemma server, attaches the reference
-// transcript, and reports Type assisted-intent.
+// transcript, and parses the trailing metadata line into structured fields.
 func TestInterpretAssistedRoutesToHotGemma(t *testing.T) {
 	in := writeFakeAudioInput(t)
 	sawAudio := false
-	srv := newFakeGemmaServer(t, "spin up, not conflict", contentString, &sawAudio)
+	srv := newFakeGemmaServer(t, "стартуют, не конфликтуют\n[[type: question | tone: neutral | urgency: normal]]", contentString, &sawAudio)
 
 	// One recognizer via a fake crispasr so the assisted ensemble produces a ref.
 	e := New(Config{
@@ -154,13 +155,13 @@ func TestInterpretAssistedRoutesToHotGemma(t *testing.T) {
 	if !sawAudio {
 		t.Fatal("gemma server did not receive an input_audio part")
 	}
-	if res.Type != "assisted-intent" {
-		t.Fatalf("type = %q, want assisted-intent", res.Type)
+	if res.Type != "question" {
+		t.Fatalf("type = %q, want question (parsed from meta line)", res.Type)
 	}
-	if res.Intent != "spin up, not conflict" {
+	if res.Intent != "стартуют, не конфликтуют" {
 		t.Fatalf("intent = %q", res.Intent)
 	}
-	if len(res.Transcripts) != 1 || !strings.Contains(res.Transcripts[0].Text, "spin up") {
+	if len(res.Transcripts) != 1 || !strings.Contains(res.Transcripts[0].Text, "стартуют") {
 		t.Fatalf("transcripts = %+v, want the ensemble ref attached", res.Transcripts)
 	}
 }
@@ -221,8 +222,9 @@ func TestInterpretColdSpawnFallback(t *testing.T) {
 	if res.Intent != "Cold spawn answer." {
 		t.Fatalf("intent = %q, want the fake CLI's final answer", res.Intent)
 	}
-	if res.Type != "intent" {
-		t.Fatalf("type = %q, want intent", res.Type)
+	// The fake CLI emits no metadata line, so structure stays empty (best-effort).
+	if res.Type != "" || res.Tone != "" || res.Urgency != "" {
+		t.Fatalf("structure = {type:%q tone:%q urgency:%q}, want all empty", res.Type, res.Tone, res.Urgency)
 	}
 }
 

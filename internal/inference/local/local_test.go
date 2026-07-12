@@ -15,8 +15,8 @@ func TestExtractGemmaFinal(t *testing.T) {
 		},
 		{
 			name: "real gemma output",
-			in:   "\n\n<|channel>thought\n1. Analyze...\n(...)<channel|>Lama and Crisp conflict every round when I mention them, or do they stay in memory for a cold start?\n\n\n",
-			want: "Lama and Crisp conflict every round when I mention them, or do they stay in memory for a cold start?",
+			in:   "\n\n<|channel>thought\n1. Analyze...\n(...)<channel|>Lama и Crisp конфликтуют каждый раунд, когда я их упоминаю, или они остаются в памяти для холодного старта?\n\n\n",
+			want: "Lama и Crisp конфликтуют каждый раунд, когда я их упоминаю, или они остаются в памяти для холодного старта?",
 		},
 		{
 			name: "no channel markers falls back to last line",

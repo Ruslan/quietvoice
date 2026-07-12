@@ -58,11 +58,14 @@ func gemmaChatServer(ctx context.Context, client *http.Client, base, token, wavP
 				}},
 			}},
 		},
-		"temperature": 0.2,
-		// Gemma E4B emits a reasoning block before its answer; 512 was consumed
-		// entirely by reasoning on assisted reconcile, cutting off the final
-		// answer (empty content). Give room for think + concise answer.
-		"max_tokens": 1536,
+		// temp 0 for determinism: same audio must not yield different intents
+		// (one run kept "Claude", another dropped it — doc/eval-listen-gemma-drops-meaning.md).
+		"temperature": 0.0,
+		// Gemma E4B emits a reasoning block before its answer; fidelity mode returns
+		// the FULL message (no ~100-token cap), so give ample room for think + a
+		// complete, non-truncated answer. (Long narrations also want a bigger --ctx-size
+		// on the gemma server — separate follow-up.)
+		"max_tokens": 3072,
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(base, "/v1/chat/completions"), bytes.NewReader(body))

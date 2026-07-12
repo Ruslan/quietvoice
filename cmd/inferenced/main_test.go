@@ -92,7 +92,7 @@ func TestUploadVoiceAcceptsTranscript(t *testing.T) {
 	eng := local.New(local.Config{WorkDir: t.TempDir(), TTSServerURLs: []string{srv.URL}, TTSVoice: "ded"})
 	n := &node{eng: eng, local: eng, workDir: t.TempDir()}
 
-	transcript := "hello"
+	transcript := "привет"
 	rr := httptest.NewRecorder()
 	n.uploadVoice(rr, buildVoiceRequest(t, "ded", &transcript, []byte("RIFFref")))
 	if rr.Code != http.StatusCreated {
@@ -100,5 +100,73 @@ func TestUploadVoiceAcceptsTranscript(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&uploads); got != 1 {
 		t.Fatalf("upstream received %d uploads, want 1", got)
+	}
+}
+
+// recordingBackend is a fake replica that records the exact path + query it was
+// reached at, so a raw-tunnel test can prove the request was forwarded verbatim
+// (and that the routing ?model= param was stripped).
+func recordingBackend(t *testing.T, gotPath, gotQuery *string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		*gotPath = r.URL.Path
+		*gotQuery = r.URL.RawQuery
+		_, _ = w.Write([]byte("hello from replica"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// rawMux builds a ServeMux with only the raw tunnel route registered on n, so a
+// test can drive it through the same pattern-matching the real server uses.
+func rawMux(n *node) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/raw/{role}/{index}/{path...}", n.rawProxy)
+	return mux
+}
+
+// TestRawProxyForwardsToReplica proves /raw/tts/1/<path> reverse-proxies verbatim
+// to the selected replica, forwarding the upstream path + query while stripping
+// the routing ?model= param.
+func TestRawProxyForwardsToReplica(t *testing.T) {
+	var gotPath, gotQuery string
+	backend := recordingBackend(t, &gotPath, &gotQuery)
+	eng := local.New(local.Config{WorkDir: t.TempDir(), TTSServerURLs: []string{backend.URL}})
+	n := &node{eng: eng, local: eng, workDir: t.TempDir()}
+	mux := rawMux(n)
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/raw/tts/1/v1/voices?model=&limit=5", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "hello from replica" {
+		t.Fatalf("body = %q, want the replica's response", rr.Body.String())
+	}
+	if gotPath != "/v1/voices" {
+		t.Fatalf("upstream path = %q, want /v1/voices", gotPath)
+	}
+	if strings.Contains(gotQuery, "model") {
+		t.Fatalf("upstream query = %q, must not carry the routing 'model' param", gotQuery)
+	}
+	if !strings.Contains(gotQuery, "limit=5") {
+		t.Fatalf("upstream query = %q, want the real 'limit=5' preserved", gotQuery)
+	}
+}
+
+// TestRawProxyMissingReplica proves an out-of-range index is a clean 404, not a
+// proxy crash.
+func TestRawProxyMissingReplica(t *testing.T) {
+	eng := local.New(local.Config{WorkDir: t.TempDir()})
+	n := &node{eng: eng, local: eng, workDir: t.TempDir()}
+	mux := rawMux(n)
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/raw/tts/1/v1/voices", nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for a nonexistent replica", rr.Code)
 	}
 }
