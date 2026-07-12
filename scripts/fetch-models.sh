@@ -8,6 +8,14 @@ set -euo pipefail
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 mkdir -p "$MODELS_DIR"; cd "$MODELS_DIR"
 
+# HF throttles single-stream downloads (~40 MB/s), so the 24 GB Gemma bf16 alone takes ~10 min
+# of paid rental. aria2c with 16 connections saturates the box link (~5-20x faster). Install it
+# once if missing; if apt is unavailable/fails we fall back to wget below (correctness unchanged).
+if ! command -v aria2c >/dev/null 2>&1; then
+  echo "→ installing aria2 (multi-connection downloader) ..."
+  apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq aria2 >/dev/null 2>&1 || true
+fi
+
 # repo  filename   (filename is identical on HF and on our boxes)
 MODELS=(
   "bartowski/google_gemma-4-E4B-it-GGUF        google_gemma-4-E4B-it-Q4_K_M.gguf"
@@ -35,8 +43,15 @@ for entry in "${MODELS[@]}"; do
   if [ -s "$file" ]; then echo "✓ $file (present)"; continue; fi
   echo "→ $file   ($repo)"
   url="https://huggingface.co/$repo/resolve/main/$file"
-  wget -q --show-progress -O "$file.part" "$url" \
-    || { echo "!! download FAILED: $url  (404? wrong repo/filename — check HF)"; rm -f "$file.part"; exit 1; }
+  if command -v aria2c >/dev/null 2>&1; then
+    # 16 connections; download to <file>.part then rename so a kill never leaves a half-file
+    # mistaken for complete. -c resumes a prior aria2c .part (via its .aria2 control file).
+    aria2c -c -x16 -s16 -k1M --file-allocation=none --console-log-level=warn -o "$file.part" "$url" \
+      || { echo "!! download FAILED: $url  (404? wrong repo/filename — check HF)"; exit 1; }
+  else
+    wget -q --show-progress -O "$file.part" "$url" \
+      || { echo "!! download FAILED: $url  (404? wrong repo/filename — check HF)"; rm -f "$file.part"; exit 1; }
+  fi
   mv "$file.part" "$file"
 done
 echo "== all models present in $MODELS_DIR =="
