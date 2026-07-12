@@ -19,6 +19,9 @@ name: quietvoice-mi300x
 services:
   inferenced-mi300x:
     image: quietvoice-inferenced-mi300x
+    pull_policy: build     # build locally; never try to pull from a registry (the image
+                           # name isn't published -> otherwise compose prints a scary red
+                           # "pull access denied ... repository does not exist" before building.
     build:
       context: ..
       dockerfile: deploy/Dockerfile.inferenced-mi300x
@@ -56,6 +59,7 @@ services:
   # One-shot: bring up the premium fleet once inferenced is healthy, then exit 0.
   boot:
     image: quietvoice-inferenced-mi300x    # reuse the image (has curl + boot-fabric.sh)
+    pull_policy: never                      # image is built by inferenced-mi300x above; use it locally
     depends_on:
       inferenced-mi300x:
         condition: service_healthy
