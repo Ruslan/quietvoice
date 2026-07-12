@@ -31,8 +31,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/inferenced 
 FROM rocm/dev-ubuntu-24.04:7.2.4
 ARG CRISPASR_ROCM_URL
 ARG LLAMACPP_ROCM_URL
+# hipblas + rocblas are REQUIRED but NOT in the base `dev` image: the crispasr /
+# llama.cpp ggml-hip libs link against libhipblas.so.3 + librocblas.so.5, and the
+# rocm/dev-ubuntu-24.04:7.2.4 base ships the HIP runtime but not the BLAS packages.
+# ROCm 7.2.4 apt provides the exact matching sonames (hipblas 3.2 -> .so.3,
+# rocblas 5.2 -> .so.5), so install them here (pulls hipblaslt + rocsolver as deps).
+# Verified on real MI300X 2026-07-12: without these, every replica dies with
+# "libhipblas.so.3: cannot open shared object file" and the fleet never boots.
 RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends ffmpeg wget curl ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg wget curl ca-certificates hipblas rocblas \
  && rm -rf /var/lib/apt/lists/*
 
 # Fetch + unpack the prebuilt ROCm bundles.
@@ -46,7 +53,14 @@ WORKDIR /opt/qv
 RUN test -n "$CRISPASR_ROCM_URL" && test -n "$LLAMACPP_ROCM_URL" \
  && wget -qO crispasr.tgz "$CRISPASR_ROCM_URL" && tar xzf crispasr.tgz && rm crispasr.tgz \
  && mkdir -p llamacpp && wget -qO llamacpp.tgz "$LLAMACPP_ROCM_URL" \
- && tar xzf llamacpp.tgz -C llamacpp && rm llamacpp.tgz
+ && tar xzf llamacpp.tgz -C llamacpp && rm llamacpp.tgz \
+ && ldconfig -n /opt/qv/rocm-mi300x/lib /opt/qv/llamacpp/bin
+# ⚠️ The llamacpp.tgz ships only versioned libs (libllama.so.0.0.1, libmtmd.so.0.0.1,
+# libggml*.so.0.15.3) WITHOUT the soname symlinks the linker needs (libllama.so.0 …).
+# `ldconfig -n <dir>` synthesizes those symlinks from each lib's embedded SONAME.
+# Verified on real MI300X 2026-07-12: without it llama-server (Gemma) dies with
+# "libllama-common.so.0: cannot open shared object file". (crispasr's bundle already
+# carries its symlinks; ldconfig-ing its dir too is harmless.)
 
 ENV CRISPASR_DIR=/opt/qv/rocm-mi300x \
     LLAMA_DIR=/opt/qv/llamacpp/bin
