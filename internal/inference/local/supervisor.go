@@ -322,7 +322,7 @@ func (c *roleLauncher) launch(_ context.Context, role, model string, port int) (
 	cmd := exec.Command(plan.bin, plan.args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = childProcAttr() // platform-specific: see procattr_{unix,windows}.go
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// A non-nil env carries this role's own LD_LIBRARY_PATH (e.g. gemma's
 	// llama-server dir vs crispasr's dir). Nil means inherit inferenced's env.
 	if plan.env != nil {

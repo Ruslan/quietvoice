@@ -618,24 +618,10 @@ func (e *Engine) pickRecognizer(model string) (Recognizer, error) {
 }
 
 // langFor picks the ASR language hint for a request: the per-request Language
-// the control plane forwarded (when it states one), else the node's configured
-// default. This is where "language lives in the control plane" is enforced.
-//
-// 🔑 "auto" is the control plane's DEFAULT, not a decision — it means "no
-// preference, node decides". Treating it as a decision makes ASR_LANG on the
-// node dead config: an operator who pinned a language is silently overridden by
-// a caller that never chose anything.
-//
-// 🪤 Cost of getting this wrong, measured 2026-09-06: the node had ASR_LANG=ru,
-// the control plane forwarded "auto", and crispasr ran whisper language-detect
-// ahead of the qwen3-asr backend. That combination crashes the worker — exit
-// 0xC0000409 from the CLI, "internal error: bad conversion" from the server — on
-// EVERY request. The pool dutifully failed over to the CPU whisper at 0.4x
-// realtime, so nothing looked broken except that voice replies arrived ~20 s
-// late. Pinning the language skips language-detect entirely: same worker, same
-// file, 4.5x realtime.
+// the control plane forwarded (when set), else the node's configured default.
+// This is where "language lives in the control plane" is enforced.
 func (e *Engine) langFor(req inference.InterpretRequest) string {
-	if l := strings.TrimSpace(req.Language); l != "" && !strings.EqualFold(l, "auto") {
+	if l := strings.TrimSpace(req.Language); l != "" {
 		return l
 	}
 	return e.cfg.Lang
